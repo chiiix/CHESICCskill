@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+openpyxl
+pillow
+easyocr
+opencv-python-headless
+paddlepaddle==3.0.0
+paddleocr<3
+albumentations<2
