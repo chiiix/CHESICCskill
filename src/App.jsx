@@ -61,6 +61,7 @@ function App() {
   const [taskId, setTaskId] = useState('TASK-20260520-0001');
   const [lastMessage, setLastMessage] = useState('演示数据已载入，可直接校正或导出。');
   const [recognitionMode, setRecognitionMode] = useState('演示数据');
+  const [recognitionDetail, setRecognitionDetail] = useState('当前使用内置演示数据。');
 
   const selectedRow = rows.find((row) => row.id === selectedId) || rows[0];
   const confirmedCount = rows.filter((row) => row.status === '已确认').length;
@@ -101,8 +102,9 @@ function App() {
       setFiles(data.task.files);
       setRows(data.results);
       setSelectedId(data.results[0]?.id || 1);
-      setRecognitionMode(data.task.mode === 'ocr' ? 'OCR识别模式' : '轻量识别模式');
-      setLastMessage(data.task.mode === 'ocr' ? 'OCR识别任务已完成，结果可在表格中校正。' : `OCR暂不可用，已降级为轻量识别。${data.task.modeError || ''}`);
+      setRecognitionMode(data.task.llmUsed ? 'AI增强模式' : (data.task.mode === 'ocr' ? 'OCR识别模式' : '轻量识别模式'));
+      setRecognitionDetail(data.task.llmMessage || (data.task.mode === 'ocr' ? '已启用 PaddleOCR/EasyOCR 文字识别和 OpenCV 候选选项框检测。' : 'OCR模型暂不可用，已读取上传图片并完成基础图像分析。'));
+      setLastMessage(data.task.llmUsed ? '大模型结构化增强已完成，结果可在表格中校正。' : (data.task.mode === 'ocr' ? 'OCR识别任务已完成，结果可在表格中校正。' : `OCR暂不可用，已降级为轻量识别。${data.task.modeError || ''}`));
     } catch (error) {
       setFiles(localFiles.map((item, index) => ({
         ...item,
@@ -111,6 +113,7 @@ function App() {
       })));
       setRows(sampleRows);
       setRecognitionMode('后端未连接');
+      setRecognitionDetail('前端没有连上 127.0.0.1:8000，上传不会进入后端识别。');
       setLastMessage('后端服务未启动，当前只能显示本地演示结果。请先启动 8000 后端。');
     } finally {
       setUploading(false);
@@ -237,7 +240,7 @@ function App() {
               <PanelHeader title="处理流程" />
               <div className={`mode-banner ${recognitionMode === '后端未连接' ? 'offline' : ''}`}>
                 <strong>{recognitionMode}</strong>
-                <span>{recognitionMode === 'OCR识别模式' ? '已启用 PaddleOCR/EasyOCR 文字识别和 OpenCV 候选选项框检测。' : recognitionMode === '轻量识别模式' ? 'OCR模型暂不可用，已读取上传图片并完成基础图像分析。' : recognitionMode === '后端未连接' ? '前端没有连上 127.0.0.1:8000，上传不会进入后端识别。' : '当前使用内置演示数据。'}</span>
+                <span>{recognitionDetail}</span>
               </div>
               <div className="stepper">
                 {['上传图片', '图像预处理', 'OCR识别', '选项识别', '结果生成'].map((label, index) => (

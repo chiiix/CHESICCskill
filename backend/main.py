@@ -4,6 +4,8 @@ import json
 import os
 import re
 import sqlite3
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime
 from functools import lru_cache
@@ -28,6 +30,25 @@ PADDLE_OCR_DIR.mkdir(exist_ok=True)
 os.environ.setdefault("PADDLE_OCR_BASE_DIR", str(PADDLE_OCR_DIR))
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
 os.environ.setdefault("FLAGS_use_onednn", "0")
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_env_file(BASE_DIR / ".env")
+
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+LLM_MODEL = os.environ.get("LLM_MODEL", "")
+LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "60"))
 
 try:
     import cv2
@@ -487,6 +508,148 @@ def build_lightweight_rows(task_id: str, file_results: list[dict[str, Any]], err
     return rows
 
 
+def llm_enabled() -> bool:
+    return bool(LLM_API_KEY and LLM_MODEL)
+
+
+def compact_file_results(file_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compact = []
+    for index, result in enumerate(file_results, start=1):
+        ocr = result.get("ocr", {})
+        compact.append(
+            {
+                "imageIndex": index,
+                "analysis": result.get("analysis", {}),
+                "ocrEngine": ocr.get("engine", ""),
+                "ocrText": ocr.get("text", "")[:6000],
+                "ocrItems": [
+                    {
+                        "text": item.get("text"),
+                        "confidence": item.get("confidence"),
+                        "rect": item.get("rect"),
+                    }
+                    for item in ocr.get("items", [])[:120]
+                ],
+                "checkboxes": result.get("checkboxes", [])[:120],
+            }
+        )
+    return compact
+
+
+def normalize_llm_rows(task_id: str, data: Any) -> list[dict[str, Any]]:
+    rows_source = data.get("rows", data) if isinstance(data, dict) else data
+    if not isinstance(rows_source, list):
+        raise ValueError("大模型返回内容不是数组")
+
+    rows: list[dict[str, Any]] = []
+    for index, item in enumerate(rows_source, start=1):
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question") or item.get("题目") or "").strip()
+        answer = str(item.get("answer") or item.get("答案") or "").strip()
+        if not question and not answer:
+            continue
+        options = item.get("options") or item.get("选项") or []
+        if not isinstance(options, list):
+            options = [str(options)]
+        confidence = item.get("confidence") or item.get("置信度") or 80
+        try:
+            confidence = int(float(confidence))
+        except (TypeError, ValueError):
+            confidence = 80
+        rows.append(
+            {
+                "id": index,
+                "taskId": task_id,
+                "question": question or f"题目 {index}",
+                "answer": answer or "请人工确认",
+                "confidence": max(1, min(99, confidence)),
+                "status": str(item.get("status") or item.get("状态") or "待确认"),
+                "type": str(item.get("type") or item.get("题型") or "大模型解析"),
+                "options": [str(option) for option in options[:20]],
+                "source": "llm",
+            }
+        )
+    if not rows:
+        raise ValueError("大模型未返回有效题目")
+    return rows
+
+
+def extract_json_object(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start : end + 1])
+        start = text.find("[")
+        end = text.rfind("]")
+        if start >= 0 and end > start:
+            return json.loads(text[start : end + 1])
+        raise
+
+
+def enhance_rows_with_llm(task_id: str, file_results: list[dict[str, Any]], fallback_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+    if not llm_enabled():
+        return fallback_rows, "大模型未配置"
+
+    payload = {
+        "model": LLM_MODEL,
+        "temperature": 0.1,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是问卷识别结果结构化解析助手。你只能返回JSON，不要返回Markdown。"
+                    "根据OCR文本、文字坐标、候选勾选框和规则解析结果，整理出问卷题目、题型、选项和答案。"
+                    "如果无法确定答案，answer写“请人工确认”，status写“待确认”或“需复核”。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "schema": {
+                            "rows": [
+                                {
+                                    "question": "题目内容",
+                                    "answer": "识别答案",
+                                    "confidence": 1,
+                                    "status": "待确认",
+                                    "type": "单选题/多选题/填空题/OCR文本",
+                                    "options": ["选项A", "选项B"],
+                                }
+                            ]
+                        },
+                        "ocrAndCheckboxData": compact_file_results(file_results),
+                        "ruleRows": fallback_rows,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        f"{LLM_BASE_URL}/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {LLM_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=LLM_TIMEOUT) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+        content = response_data["choices"][0]["message"]["content"]
+        rows = normalize_llm_rows(task_id, extract_json_object(content))
+        return rows, "大模型结构化增强完成"
+    except (urllib.error.URLError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        return fallback_rows, f"大模型增强失败，已保留规则解析结果：{exc}"
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
@@ -501,6 +664,9 @@ def health() -> dict[str, Any]:
         "paddleInstalled": paddle is not None,
         "easyocrInstalled": easyocr is not None,
         "opencvInstalled": cv2 is not None,
+        "llmEnabled": llm_enabled(),
+        "llmBaseUrl": LLM_BASE_URL if llm_enabled() else "",
+        "llmModel": LLM_MODEL if llm_enabled() else "",
     }
 
 
@@ -546,9 +712,11 @@ async def create_task(files: list[UploadFile] = File(...)) -> dict[str, Any]:
             }
         )
 
-    results = build_ocr_rows(task_id, file_results) if mode == "ocr" else build_lightweight_rows(task_id, file_results, mode_error)
+    rule_results = build_ocr_rows(task_id, file_results) if mode == "ocr" else build_lightweight_rows(task_id, file_results, mode_error)
+    results, llm_message = enhance_rows_with_llm(task_id, file_results, rule_results)
+    llm_used = any(row.get("source") == "llm" for row in results)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    status = "OCR识别完成" if mode == "ocr" else "轻量识别完成"
+    status = "大模型增强完成" if llm_used else ("OCR识别完成" if mode == "ocr" else "轻量识别完成")
     with connect() as db:
         db.execute(
             "INSERT INTO tasks (id, name, created_at, file_count, status) VALUES (?, ?, ?, ?, ?)",
@@ -581,6 +749,9 @@ async def create_task(files: list[UploadFile] = File(...)) -> dict[str, Any]:
             "status": status,
             "mode": mode,
             "modeError": mode_error,
+            "llmEnabled": llm_enabled(),
+            "llmUsed": llm_used,
+            "llmMessage": llm_message,
             "files": saved_files,
         },
         "results": results,

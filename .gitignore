@@ -3,3 +3,7 @@ dist/
 backend/data/
 __pycache__/
 *.pyc
+.env
+backend/.env
+tmp/
+*.log
